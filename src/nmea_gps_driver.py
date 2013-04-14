@@ -70,11 +70,8 @@ def addTFPrefix(frame_id):
 #Check the NMEA sentence checksum. Return True if passes and False if failed
 def check_checksum(nmea_sentence):
     split_sentence = nmea_sentence.split('*')
-    if len(split_sentence) != 2:
-        #No checksum bytes were found... improperly formatted/incomplete NMEA data?
-        return False
     transmitted_checksum = split_sentence[1].strip()
-
+    
     #Remove the $ at the front
     data_to_checksum = split_sentence[0][1:]
     checksum = 0
@@ -97,18 +94,11 @@ if __name__ == "__main__":
         frame_id = addTFPrefix(frame_id)
 
     time_ref_source = rospy.get_param('~time_ref_source', frame_id)
-    useRMC = rospy.get_param('~useRMC', False)
-    #useRMC == True -> generate info from RMC+GSA
-    #useRMC == False -> generate info from GGA
-    navData = NavSatFix()
-    gpsVel = TwistStamped()
-    gpstime = TimeReference()
-    gpstime.source = time_ref_source
-    navData.header.frame_id = frame_id
-    gpsVel.header.frame_id = frame_id
+    trigger = "$GP" + rospy.get_param('~trigger', "GGA")
     GPSLock = False
     try:
         GPS = serial.Serial(port=GPSport, baudrate=GPSrate, timeout=2)
+        lastmsg = {}
         #Read in GPS
         while not rospy.is_shutdown():
             #read GPS line
@@ -123,99 +113,137 @@ if __name__ == "__main__":
             for i in fields:
                 i = i.strip(',')
             try:
-                if useRMC:
-                    #Check for satellite lock
-                    if 'GSA' in fields[0]:
-                        lockState = int(fields[2])
-                        #print 'lockState=',lockState
-                        if lockState == 3:
-                            GPSLock = True
-                        else:
-                            GPSLock = False
-                    #if not satellite lock message parse it separately
+                lastmsg[fields[0]] = fields
+                if fields[0] != trigger:
+                    continue
+
+                publish_vel = False
+                publish_time = False
+                gpsVel = TwistStamped()
+                navData = NavSatFix()
+                gpsVel = TwistStamped()
+                gpstime = TimeReference()
+                gpstime.source = time_ref_source
+                gpstime.header.stamp = timeNow
+                navData.header.frame_id = frame_id
+                gpsVel.header.frame_id = frame_id
+
+                # Now fields[0] is our trigger, try to build a GPSFix message
+                # will all the information we have
+
+                # TODO: complete treatment of GPGSA GPGSV (satellites in view)
+
+                if '$GPGSA' in lastmsg:
+                    fields = lastmsg["$GPGSA"]
+                    lockState = int(fields[2])
+                    #print 'lockState=',lockState
+                    if lockState == 3:
+                        GPSLock = True
                     else:
-                        if GPSLock == True:
-                            if 'RMC' in fields[0]:
-                                #print fields
-                                gpsVel.header.stamp = timeNow
-                                gpsVel.twist.linear.x = float(fields[7])*0.514444444444*math.sin(float(fields[8]))
-                                gpsVel.twist.linear.y = float(fields[7])*0.514444444444*math.cos(float(fields[8]))
-                                gpsVelPub.publish(gpsVel)
+                        GPSLock = False
 
-                                navData.status.status = NavSatStatus.STATUS_FIX
-                                navData.header.stamp = gpsVel.header.stamp
-                                navData.status.service = NavSatStatus.SERVICE_GPS
+                if ("$GPRMC" in lastmsg) and GPSLock:
+                    fields = lastmsg["$GPRMC"]
+                    # Conversion to radian
+                    navData.track = float(fields[8])*math.pi/180.
+                    # Conversion from knots to m/s
+                    navData.speed = float(fields[7])*0.514444444444
+                    #print fields
+                    gpsVel.header.stamp = timeNow
+                    gpsVel.twist.linear.x = navData.speed*math.sin(navData.track)
+                    gpsVel.twist.linear.y = navData.speed*math.cos(navData.track)
+                    publish_vel = True
 
-                                gpstime.header.stamp = gpsVel.header.stamp
-                                gpstime.time_ref = convertNMEATimeToROS(fields[1])
+                    navData.status.status = NavSatStatus.STATUS_FIX
+                    navData.header.stamp = gpsVel.header.stamp
+                    navData.status.service = NavSatStatus.SERVICE_GPS
 
-                                longitude = float(fields[5][0:3]) + float(fields[5][3:])/60
-                                if fields[6] == 'W':
-                                    longitude = -longitude
+                    publish_time = True
+                    gpstime.header.stamp = gpsVel.header.stamp
+                    gpstime.time_ref = convertNMEATimeToROS(fields[1])
 
-                                latitude = float(fields[3][0:2]) + float(fields[3][2:])/60
-                                if fields[4] == 'S':
-                                    latitude = -latitude
+                    longitude = float(fields[5][0:3]) + float(fields[5][3:])/60
+                    if fields[6] == 'W':
+                        longitude = -longitude
 
-                                #publish data
-                                navData.latitude = latitude
-                                navData.longitude = longitude
-                                navData.altitude = float('NaN')
-                                navData.position_covariance_type = NavSatFix.COVARIANCE_TYPE_UNKNOWN
-                                gpspub.publish(navData)
-                                gpstimePub.publish(gpstime)
-                        else:
-                            pass
-                            #print data
-                else:
+                    latitude = float(fields[3][0:2]) + float(fields[3][2:])/60
+                    if fields[4] == 'S':
+                        latitude = -latitude
+
+                    #publish data
+                    navData.latitude = latitude
+                    navData.longitude = longitude
+                    navData.altitude = float('NaN')
+                    navData.position_covariance_type = NavSatFix.COVARIANCE_TYPE_UNKNOWN
+
+                if "$GPVTG" in lastmsg:
+                    fields = lastmsg["$GPVTG"]
+                    # Conversion to radian
+                    navData.track = float(fields[1])*math.pi/180.
+                    # Conversion from knots to m/s
+                    navData.speed = float(fields[5])*0.514444444444
+                    gpsVel.header.stamp = timeNow
+                    gpsVel.twist.linear.x = navData.speed*math.sin(navData.track)
+                    gpsVel.twist.linear.y = navData.speed*math.cos(navData.track)
+                    publish_vel = True
+
+                if "$GPGGA" in lastmsg:
                     #Use GGA
                     #No /vel output from just GGA
-                    if 'GGA' in fields[0]:
-                        gps_quality = int(fields[6])
-                        if gps_quality == 0:
-                            navData.status.status = NavSatStatus.STATUS_NO_FIX
-                        elif gps_quality == 1:
-                            navData.status.status = NavSatStatus.STATUS_FIX
-                        elif gps_quality == 2:
-                            navData.status.status = NavSatStatus.STATUS_SBAS_FIX
-                        elif gps_quality in (4,5):
-                            #Maybe 2 should also sometimes be GBAS... but pretty
-                            #sure RTK has to have a base station
-                            navData.status.status = NavSatStatus.STATUS_GBAS_FIX
-                        else:
-                            navData.status.status = NavSatStatus.STATUS_NO_FIX
-                        navData.status.service = NavSatStatus.SERVICE_GPS
+                    fields = lastmsg["$GPGGA"]
+                    gps_quality = int(fields[6])
+                    if gps_quality == 0:
+                        navData.status.status = NavSatStatus.STATUS_NO_FIX
+                    elif gps_quality == 1:
+                        navData.status.status = NavSatStatus.STATUS_FIX
+                    elif gps_quality == 2:
+                        navData.status.status = NavSatStatus.STATUS_SBAS_FIX
+                    elif gps_quality in (4,5):
+                        #Maybe 2 should also sometimes be GBAS... but pretty
+                        #sure RTK has to have a base station
+                        navData.status.status = NavSatStatus.STATUS_GBAS_FIX
+                    else:
+                        navData.status.status = NavSatStatus.STATUS_NO_FIX
+                    navData.status.service = NavSatStatus.SERVICE_GPS
+                    navData.status.satellites_visible = int(fields[7])
 
-                        navData.header.stamp = timeNow
+                    navData.header.stamp = timeNow
 
-                        latitude = float(fields[2][0:2]) + float(fields[2][2:])/60
-                        if fields[3] == 'S':
-                            latitude = -latitude
-                        navData.latitude = latitude
+                    if navData.status.status != NavSatStatus.STATUS_NO_FIX:
+                      latitude = float(fields[2][0:2]) + float(fields[2][2:])/60
+                      if fields[3] == 'S':
+                          latitude = -latitude
+                      navData.latitude = latitude
 
-                        longitude = float(fields[4][0:3]) + float(fields[4][3:])/60
-                        if fields[5] == 'W':
-                            longitude = -longitude
-                        navData.longitude = longitude
+                      longitude = float(fields[4][0:3]) + float(fields[4][3:])/60
+                      if fields[5] == 'W':
+                          longitude = -longitude
+                      navData.longitude = longitude
 
-                        hdop = float(fields[8])
-                        navData.position_covariance[0] = hdop**2
-                        navData.position_covariance[4] = hdop**2
-                        navData.position_covariance[8] = (2*hdop)**2 #FIX ME
-                        navData.position_covariance_type = NavSatFix.COVARIANCE_TYPE_APPROXIMATED
+                      hdop = float(fields[8])
+                      navData.position_covariance[0] = hdop**2
+                      navData.position_covariance[4] = hdop**2
+                      navData.position_covariance[8] = (2*hdop)**2 #FIX ME
+                      navData.position_covariance_type = NavSatFix.COVARIANCE_TYPE_APPROXIMATED
 
-                        #Altitude is above ellipsoid, so adjust for mean-sea-level
-                        altitude = float(fields[9]) + float(fields[11])
-                        navData.altitude = altitude
+                      #Altitude is above ellipsoid, so adjust for mean-sea-level
+                      altitude = float(fields[9]) + float(fields[11])
+                      navData.altitude = altitude
 
 
-                        gpstime.header.stamp = timeNow
-                        gpstime.time_ref = convertNMEATimeToROS(fields[1])
+                      publish_time = True
+                      gpstime.time_ref = convertNMEATimeToROS(fields[1])
 
-                        gpspub.publish(navData)
-                        gpstimePub.publish(gpstime)
+                gpspub.publish(navData)
+                if publish_vel:
+                    gpsVelPub.publish(gpsVel)
+                if publish_time:
+                    gpstimePub.publish(gpstime)
+                lastmsg = {}
+                GPSLock = False
+
             except ValueError as e:
-                rospy.logwarn("Value error, likely due to missing fields in the NMEA messages. Error was: %s" % e)
+                rospy.logwarn("Value error, likely due to missing fields in the NMEA messages (%s). Error was: %s" % (data,e))
 
     except rospy.ROSInterruptException:
         GPS.close() #Close GPS serial port
