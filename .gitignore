@@ -33,3 +33,8 @@ nosetests.xml
 .mr.developer.cfg
 .project
 .pydevproject
+build/
+src/nmea_gps_driver/
+*.pyc
+*.pyo
+*.swp
