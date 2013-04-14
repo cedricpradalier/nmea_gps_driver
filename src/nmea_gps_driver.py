@@ -35,6 +35,7 @@
 import roslib
 roslib.load_manifest('nmea_gps_driver')
 import rospy
+from gps_common.msg import GPSFix, GPSStatus
 from sensor_msgs.msg import NavSatFix
 from sensor_msgs.msg import NavSatStatus
 from sensor_msgs.msg import TimeReference
@@ -80,10 +81,23 @@ def check_checksum(nmea_sentence):
 
     return ("%02X" % checksum)  == transmitted_checksum.upper()
 
+def ExtFix2Fix(data):
+    fix = NavSatFix()
+    fix.header = data.header
+    fix.status.status = data.status.status
+    fix.status.service = data.status.position_source
+    fix.latitude = data.latitude
+    fix.longitude = data.longitude
+    fix.altitude = data.altitude
+    fix.position_covariance = data.position_covariance
+    fix.position_covariance_type = data.position_covariance_type
+    return fix
+
 if __name__ == "__main__":
     #init publisher
     rospy.init_node('nmea_gps_driver')
     gpspub = rospy.Publisher('fix', NavSatFix)
+    egpspub = rospy.Publisher('extfix', GPSFix)
     gpsVelPub = rospy.Publisher('vel',TwistStamped)
     gpstimePub = rospy.Publisher('time_reference', TimeReference)
     #Init GPS port
@@ -96,6 +110,7 @@ if __name__ == "__main__":
     time_ref_source = rospy.get_param('~time_ref_source', frame_id)
     trigger = "$GP" + rospy.get_param('~trigger', "GGA")
     GPSLock = False
+    navData = GPSFix()
     try:
         GPS = serial.Serial(port=GPSport, baudrate=GPSrate, timeout=2)
         lastmsg = {}
@@ -112,6 +127,8 @@ if __name__ == "__main__":
             fields = data.split(',')
             for i in fields:
                 i = i.strip(',')
+            fields[-1] = fields[-1].split("*")[0] # xxx*XX
+
             try:
                 lastmsg[fields[0]] = fields
                 if fields[0] != trigger:
@@ -120,18 +137,17 @@ if __name__ == "__main__":
                 publish_vel = False
                 publish_time = False
                 gpsVel = TwistStamped()
-                navData = NavSatFix()
-                gpsVel = TwistStamped()
                 gpstime = TimeReference()
                 gpstime.source = time_ref_source
                 gpstime.header.stamp = timeNow
+                navData.status.header.frame_id = frame_id
                 navData.header.frame_id = frame_id
                 gpsVel.header.frame_id = frame_id
 
                 # Now fields[0] is our trigger, try to build a GPSFix message
                 # will all the information we have
 
-                # TODO: complete treatment of GPGSA GPGSV (satellites in view)
+                # TODO: complete treatment of GPGSV (satellites in view)
 
                 if '$GPGSA' in lastmsg:
                     fields = lastmsg["$GPGSA"]
@@ -139,8 +155,23 @@ if __name__ == "__main__":
                     #print 'lockState=',lockState
                     if lockState == 3:
                         GPSLock = True
+                        navData.status.status = GPSStatus.STATUS_FIX
                     else:
                         GPSLock = False
+                        navData.status.status = GPSStatus.STATUS_NO_FIX
+                    navData.pdop = float(fields[15])
+                    navData.hdop = float(fields[16])
+                    navData.vdop = float(fields[17])
+                    navData.status.satellite_visible_prn = []
+                    for i in range(3,15):
+                        if fields[i]=="":
+                            break
+                        navData.status.satellite_visible_prn.append(int(fields[i]))
+                    navData.status.satellites_visible = len(navData.status.satellite_visible_prn)
+                    # In case nobody provides better data:
+                    navData.status.satellites_used = navData.status.satellites_visible
+                    navData.status.satellite_used_prn = navData.status.satellite_visible_prn
+
 
                 if ("$GPRMC" in lastmsg) and GPSLock:
                     fields = lastmsg["$GPRMC"]
@@ -154,9 +185,9 @@ if __name__ == "__main__":
                     gpsVel.twist.linear.y = navData.speed*math.cos(navData.track)
                     publish_vel = True
 
-                    navData.status.status = NavSatStatus.STATUS_FIX
-                    navData.header.stamp = gpsVel.header.stamp
-                    navData.status.service = NavSatStatus.SERVICE_GPS
+                    navData.header.stamp = timeNow
+                    navData.status.position_source = GPSStatus.SOURCE_GPS
+                    navData.status.motion_source = GPSStatus.SOURCE_GPS
 
                     publish_time = True
                     gpstime.header.stamp = gpsVel.header.stamp
@@ -193,23 +224,27 @@ if __name__ == "__main__":
                     fields = lastmsg["$GPGGA"]
                     gps_quality = int(fields[6])
                     if gps_quality == 0:
-                        navData.status.status = NavSatStatus.STATUS_NO_FIX
+                        navData.status.status = GPSStatus.STATUS_NO_FIX
                     elif gps_quality == 1:
-                        navData.status.status = NavSatStatus.STATUS_FIX
+                        navData.status.status = GPSStatus.STATUS_FIX
                     elif gps_quality == 2:
-                        navData.status.status = NavSatStatus.STATUS_SBAS_FIX
+                        navData.status.status = GPSStatus.STATUS_SBAS_FIX
                     elif gps_quality in (4,5):
                         #Maybe 2 should also sometimes be GBAS... but pretty
                         #sure RTK has to have a base station
-                        navData.status.status = NavSatStatus.STATUS_GBAS_FIX
+                        navData.status.status = GPSStatus.STATUS_GBAS_FIX
                     else:
-                        navData.status.status = NavSatStatus.STATUS_NO_FIX
-                    navData.status.service = NavSatStatus.SERVICE_GPS
-                    navData.status.satellites_visible = int(fields[7])
+                        navData.status.status = GPSStatus.STATUS_NO_FIX
+                    navData.status.position_source = GPSStatus.SOURCE_GPS
+                    navData.status.motion_source = GPSStatus.SOURCE_GPS
+                    if navData.status.satellites_used == 0:
+                        # We don't have better data
+                        navData.status.satellites_used = int(fields[7])
+                        navData.status.satellites_visible = navData.status.satellites_used
 
                     navData.header.stamp = timeNow
 
-                    if navData.status.status != NavSatStatus.STATUS_NO_FIX:
+                    if navData.status.status != GPSStatus.STATUS_NO_FIX:
                       latitude = float(fields[2][0:2]) + float(fields[2][2:])/60
                       if fields[3] == 'S':
                           latitude = -latitude
@@ -220,11 +255,11 @@ if __name__ == "__main__":
                           longitude = -longitude
                       navData.longitude = longitude
 
-                      hdop = float(fields[8])
-                      navData.position_covariance[0] = hdop**2
-                      navData.position_covariance[4] = hdop**2
-                      navData.position_covariance[8] = (2*hdop)**2 #FIX ME
-                      navData.position_covariance_type = NavSatFix.COVARIANCE_TYPE_APPROXIMATED
+                      navData.hdop = float(fields[8])
+                      navData.position_covariance[0] = navData.hdop**2
+                      navData.position_covariance[4] = navData.hdop**2
+                      navData.position_covariance[8] = (2*navData.hdop)**2 #FIX ME
+                      navData.position_covariance_type = GPSFix.COVARIANCE_TYPE_APPROXIMATED
 
                       #Altitude is above ellipsoid, so adjust for mean-sea-level
                       altitude = float(fields[9]) + float(fields[11])
@@ -234,7 +269,9 @@ if __name__ == "__main__":
                       publish_time = True
                       gpstime.time_ref = convertNMEATimeToROS(fields[1])
 
-                gpspub.publish(navData)
+                navData.status.header = navData.header
+                egpspub.publish(navData)
+                gpspub.publish(ExtFix2Fix(navData))
                 if publish_vel:
                     gpsVelPub.publish(gpsVel)
                 if publish_time:
