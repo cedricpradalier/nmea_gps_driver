@@ -225,14 +225,15 @@ if __name__ == "__main__":
 
                     if "$GPVTG" in lastmsg:
                         fields = lastmsg["$GPVTG"]
-                        # Conversion to radian
-                        navData.track = float(fields[1])*math.pi/180.
-                        # Conversion from knots to m/s
-                        navData.speed = float(fields[5])*0.514444444444
-                        gpsVel.header.stamp = timeNow
-                        gpsVel.twist.linear.x = navData.speed*math.sin(navData.track)
-                        gpsVel.twist.linear.y = navData.speed*math.cos(navData.track)
-                        publish_vel = True
+                        if fields[1] != '':
+                            # Conversion to radian
+                            navData.track = float(fields[1])*math.pi/180.
+                            # Conversion from knots to m/s
+                            navData.speed = float(fields[5])*0.514444444444
+                            gpsVel.header.stamp = timeNow
+                            gpsVel.twist.linear.x = navData.speed*math.sin(navData.track)
+                            gpsVel.twist.linear.y = navData.speed*math.cos(navData.track)
+                            publish_vel = True
 
                     if "$GPGGA" in lastmsg:
                         #Use GGA
@@ -296,7 +297,7 @@ if __name__ == "__main__":
                     GPSLock = False
 
                 except ValueError as e:
-                    rospy.logwarn("Value error, likely due to missing fields in the NMEA messages (%s). Error was: %s" % (data,e))
+                    rospy.logwarn("Value error, likely due to missing fields in the NMEA messages (%s). Error was: %s" % (fields,e))
 
     except rospy.ROSInterruptException:
         GPS.close() #Close GPS serial port
